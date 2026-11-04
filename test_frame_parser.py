@@ -2,6 +2,7 @@ import struct
 import unittest
 
 from frame_parser import EMG_COUNT, FrameParser, decode_frame
+from plot_frame import describe_event, describe_power
 
 
 def sample_frame(emg, angle, time_ms):
@@ -45,6 +46,18 @@ class FrameParserTest(unittest.TestCase):
         emg = (0,) * (EMG_COUNT - 1) + (0x0FFF,)
         frame = decode_frame(sample_frame(emg, 1, 5))
         self.assertEqual(frame["emg"][-1], 4095)
+
+    def test_status_lines_name_charge_and_event(self):
+        self.assertEqual(describe_power(None), "Зарядка: ещё не приходила")
+        self.assertEqual(
+            describe_power({"type": 0x01, "voltage_mV": 3700, "charge": 1}),
+            "Зарядка: 3700 мВ, заряд идёт (1)",
+        )
+        self.assertEqual(describe_event(None), "Устройство: событий не было")
+        self.assertEqual(
+            describe_event({"type": 0x02, "event": 3, "code": 2}),
+            "Устройство: измерение остановлено, BNO055 не ответил по I2C (3/2)",
+        )
 
 
 if __name__ == "__main__":
