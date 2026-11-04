@@ -1,16 +1,19 @@
 """График кадра 0x03: 20 отсчётов ЭМГ, угол и метка.
 
-По BLE программа только слушает notify FFF1 и сама ничего не пишет.
+COM по умолчанию COM9, 115200, 8N1: RTS выключен, DTR включён, без управления потоком.
+BLE: модуль E104-BT5032A, notify FFF1. В характеристики программа ничего не пишет.
 START (кадр 04 01 в FFF2) нужно послать отдельно, иначе измерения не начнутся.
 По COM читается тот же поток байтов, что плата отдала бы в notify.
 """
 
 import argparse
 import asyncio
+import math
 import sys
 import threading
 import time
 from collections import deque
+from uuid import UUID
 
 from frame_parser import SAMPLE_TYPE, FrameParser
 
@@ -37,6 +40,10 @@ IDEAL_GAP_MS = 10
 GAP_DROP_MS = 20
 # AT+CONPARAMS=6: интервал связи 6 × 1,25 мс. Уведомления телефона режутся этим шагом.
 BLE_CONN_MS = 7.5
+DEFAULT_NAME = "E104-BT5032A"
+DEFAULT_CHARACTERISTIC = "fff1"
+DEFAULT_PORT = "COM9"
+DEFAULT_BAUD = 115200
 # Паузы, которые прошивка ждёт всегда до рекламы: MOD 200+200, выход BNO 650,
 # на каждый из двух датчиков 19 мс, 7 мс и хотя бы один опрос кватерниона 10 мс.
 # Ответы AT и сброс модуля идут сверху. В кадр 0x03 это время не записывается.
@@ -178,6 +185,10 @@ class Live:
             "arrival_n": self.arrival_n,
         }
 
+    def reset_parser(self):
+        with self.lock:
+            self.parser.reset()
+
     def add(self, chunk):
         arrived = time.perf_counter()
         frames = self.parser.feed(chunk)
@@ -218,73 +229,192 @@ class Live:
             )
 
 
+def normalize_uuid(value):
+    value = value.strip().lower().removeprefix("0x")
+    if len(value) in (4, 8):
+        value = f"{int(value, 16):08x}-0000-1000-8000-00805f9b34fb"
+    return str(UUID(value))
+
+
+def select_device(discovered, name, address=None):
+    matches = []
+    for device, advertisement in discovered.values():
+        advertised_name = advertisement.local_name or device.name or ""
+        if address:
+            match = device.address.casefold() == address.casefold()
+        else:
+            match = advertised_name.casefold() == name.casefold()
+        if match:
+            matches.append(device)
+    if not matches:
+        raise LookupError(f"Не найдено BLE-устройство {address or name}. Проверьте питание и advertising.")
+    if len(matches) != 1:
+        addresses = ", ".join(device.address for device in matches)
+        raise LookupError(f"Найдено несколько устройств с этим именем: {addresses}. Укажите --address.")
+    return matches[0]
+
+
+def select_characteristic(services, char_uuid, service_uuid=None):
+    target = normalize_uuid(char_uuid)
+    service_filter = normalize_uuid(service_uuid) if service_uuid else None
+    candidates = []
+    available = []
+    for service in services:
+        for characteristic in service.characteristics:
+            properties = set(characteristic.properties)
+            if properties.intersection(("notify", "indicate")):
+                available.append(f"{characteristic.uuid} (service {service.uuid})")
+                if (normalize_uuid(characteristic.uuid) == target and
+                        (service_filter is None or normalize_uuid(service.uuid) == service_filter)):
+                    candidates.append(characteristic)
+    if len(candidates) != 1:
+        detail = "; ".join(available) or "нет"
+        raise LookupError(f"Нужна одна Notify/Indicate-характеристика {target}, найдено {len(candidates)}. "
+                          f"Доступные: {detail}. При совпадающих UUID задайте --service-uuid.")
+    return candidates[0]
+
+
+class OperationInterrupted(Exception):
+    pass
+
+
+async def interruptible(awaitable, stop, timeout):
+    task = asyncio.ensure_future(awaitable)
+    deadline = time.monotonic() + timeout
+    try:
+        while not task.done():
+            if stop.is_set():
+                raise OperationInterrupted()
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"BLE-операция не завершилась за {timeout:g} с")
+            await asyncio.wait({task}, timeout=0.10)
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 def run_com(args, live, stop):
     import serial
 
-    port = serial.Serial(args.port, args.baud, timeout=0.05)
-    live.message = f"{args.port}: слушаю кадры"
+    connection = None
     try:
+        connection = serial.Serial(baudrate=args.baud, timeout=0.05)
+        connection.rts = False
+        connection.dtr = True
+        connection.port = args.port
+        connection.open()
+        live.message = f"{args.port}: слушаю кадры"
         while not stop.is_set():
-            chunk = port.read(256)
+            chunk = connection.read(min(max(connection.in_waiting, 1), 8192))
             if chunk:
                 live.add(chunk)
+    except (serial.SerialException, OSError) as error:
+        live.message = f"Ошибка {args.port}: {error}"
+        print(live.message, file=sys.stderr)
+        print("Закройте другие программы, использующие порт, и проверьте --port/--baud.", file=sys.stderr)
     finally:
-        port.close()
+        if connection is not None and connection.is_open:
+            try:
+                connection.close()
+            except OSError:
+                pass
 
 
-async def run_ble(args, live, stop):
-    import bleak
+async def run_ble_session(args, live, stop, bleak_module):
+    live.message = f"Поиск {args.address or args.name}"
+    discovered = await interruptible(
+        bleak_module.BleakScanner.discover(timeout=args.scan_seconds, return_adv=True),
+        stop, args.scan_seconds + 5)
+    for device, advertisement in discovered.values():
+        print(f"  BLE: {advertisement.local_name or device.name or '(без имени)'} | {device.address}", flush=True)
+    device = select_device(discovered, args.name, args.address)
+    disconnected = asyncio.Event()
+    client = bleak_module.BleakClient(device, disconnected_callback=lambda _client: disconnected.set())
+    try:
+        live.message = f"Подключение к {device.name or args.name} ({device.address})"
+        await interruptible(client.connect(), stop, 30.0)
+        characteristic = select_characteristic(client.services, args.char_uuid, args.service_uuid)
+        live.reset_parser()
 
-    live.message = f"Поиск {args.name}"
+        def on_notification(_sender, payload):
+            if not stop.is_set():
+                live.add(bytes(payload))
 
-    def on_notify(_char, data):
-        live.add(bytes(data))
+        await interruptible(client.start_notify(characteristic, on_notification), stop, 15.0)
+        mtu = getattr(client, "mtu_size", "?")
+        live.message = (
+            f"BLE: жду кадр 0x03. Notify {characteristic.uuid}, MTU {mtu}. "
+            "START эта программа не шлёт."
+        )
+        while not stop.is_set() and client.is_connected and not disconnected.is_set():
+            try:
+                await asyncio.wait_for(disconnected.wait(), timeout=0.15)
+            except asyncio.TimeoutError:
+                pass
+        if not stop.is_set():
+            raise ConnectionError("BLE-соединение потеряно")
+    finally:
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=5.0)
+        except Exception as error:
+            print(f"Завершение BLE-сессии: {error}", file=sys.stderr, flush=True)
 
-    devices = await bleak.BleakScanner.discover(timeout=args.scan)
-    chosen = None
-    for device in devices:
-        if device.name == args.name:
-            chosen = device
+
+async def ble_loop(args, live, stop, bleak_module):
+    while not stop.is_set():
+        retry = False
+        try:
+            await run_ble_session(args, live, stop, bleak_module)
+        except OperationInterrupted:
+            pass
+        except Exception as error:
+            retry = True
+            live.message = f"BLE: {error} | повтор через 3 с"
+        if stop.is_set():
             break
-    if chosen is None:
-        live.message = f"{args.name} не найден"
-        return
-    async with bleak.BleakClient(chosen) as client:
-        char = None
-        for service in client.services:
-            for item in service.characteristics:
-                if args.char.lower() in item.uuid.lower() and "notify" in item.properties:
-                    char = item
+        if retry:
+            for _ in range(30):
+                if stop.is_set():
                     break
-        if char is None:
-            live.message = "Notify FFF1 не найден"
-            return
-        await client.start_notify(char, on_notify)
-        live.message = "BLE: жду кадр 0x03. START эта программа не шлёт."
-        while not stop.is_set() and client.is_connected:
-            await asyncio.sleep(0.1)
-        await client.stop_notify(char)
+                await asyncio.sleep(0.1)
 
 
 def ble_thread(args, live, stop):
     try:
-        asyncio.run(run_ble(args, live, stop))
+        import bleak
+        asyncio.run(ble_loop(args, live, stop, bleak))
     except Exception as error:
-        live.message = f"BLE: {error}"
+        live.message = f"BLE-поток завершён: {error}. Перезапустите приложение."
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ble", action="store_true", help="Слушать notify FFF1")
-    parser.add_argument("--port", help="COM-порт с тем же потоком байтов")
-    parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--name", default="E104-BT5032A")
-    parser.add_argument("--char", default="fff1")
-    parser.add_argument("--scan", type=float, default=6.0)
+    parser.add_argument("--ble", action="store_true", help="Слушать notify FFF1 модуля E104-BT5032A")
+    parser.add_argument("--port", help="COM-порт, по умолчанию COM9")
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Скорость UART, по умолчанию 115200")
+    parser.add_argument("--name", default=DEFAULT_NAME, help="Имя BLE-устройства")
+    parser.add_argument("--address", help="Адрес из результатов сканирования вместо выбора по имени")
+    parser.add_argument("--char-uuid", default=DEFAULT_CHARACTERISTIC, help="Notify UUID: по умолчанию fff1")
+    parser.add_argument("--service-uuid", help="UUID сервиса, если Notify UUID встречается несколько раз")
+    parser.add_argument("--scan-seconds", type=float, default=6.0)
     parser.add_argument("--window", type=float, default=5.0)
     args = parser.parse_args()
-    if args.ble == bool(args.port):
+    if args.ble and args.port:
         parser.error("Нужен один источник: --ble или --port COMx")
+    if not args.ble and not args.port:
+        args.port = DEFAULT_PORT
+    if (args.baud <= 0 or not math.isfinite(args.scan_seconds) or args.scan_seconds <= 0
+            or not math.isfinite(args.window) or args.window <= 0):
+        parser.error("Скорость, окно и время сканирования должны быть положительными.")
+    if args.ble:
+        try:
+            args.char_uuid = normalize_uuid(args.char_uuid)
+            if args.service_uuid:
+                args.service_uuid = normalize_uuid(args.service_uuid)
+        except ValueError:
+            parser.error("Неверный UUID характеристики или сервиса.")
 
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation

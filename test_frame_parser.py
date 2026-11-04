@@ -1,8 +1,19 @@
 import struct
 import unittest
+from types import SimpleNamespace
 
 from frame_parser import EMG_COUNT, FrameParser, decode_frame
-from plot_frame import describe_event, describe_power
+from plot_frame import (
+    DEFAULT_BAUD,
+    DEFAULT_CHARACTERISTIC,
+    DEFAULT_NAME,
+    DEFAULT_PORT,
+    describe_event,
+    describe_power,
+    normalize_uuid,
+    select_characteristic,
+    select_device,
+)
 
 
 def sample_frame(emg, angle, time_ms):
@@ -58,6 +69,33 @@ class FrameParserTest(unittest.TestCase):
             describe_event({"type": 0x02, "event": 3, "code": 2}),
             "Устройство: измерение остановлено, BNO055 не ответил по I2C (3/2)",
         )
+
+
+class DeviceSettingsTest(unittest.TestCase):
+    def test_defaults_match_com_and_ble_plot(self):
+        self.assertEqual(DEFAULT_PORT, "COM9")
+        self.assertEqual(DEFAULT_BAUD, 115200)
+        self.assertEqual(DEFAULT_NAME, "E104-BT5032A")
+        self.assertEqual(DEFAULT_CHARACTERISTIC, "fff1")
+
+    def test_short_and_long_uuid(self):
+        expected = "0000fff1-0000-1000-8000-00805f9b34fb"
+        for source in ("FFF1", "0xfff1", "0000fff1", expected.upper()):
+            self.assertEqual(normalize_uuid(source), expected)
+
+    def test_device_chosen_by_advertised_name_or_address(self):
+        device = SimpleNamespace(name="ignored", address="00:11:22:33:44:55")
+        discovered = {device.address: (device, SimpleNamespace(local_name="E104-BT5032A"))}
+        self.assertIs(select_device(discovered, "e104-bt5032a"), device)
+        self.assertIs(select_device(discovered, "ignored", device.address), device)
+
+    def test_one_notify_characteristic(self):
+        characteristic = SimpleNamespace(
+            uuid=normalize_uuid("fff1"),
+            properties=["notify"],
+        )
+        service = SimpleNamespace(uuid=normalize_uuid("fff0"), characteristics=[characteristic])
+        self.assertIs(select_characteristic([service], "FFF1", "fff0"), characteristic)
 
 
 if __name__ == "__main__":
