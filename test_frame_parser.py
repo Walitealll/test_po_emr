@@ -8,11 +8,16 @@ from plot_frame import (
     DEFAULT_CHARACTERISTIC,
     DEFAULT_NAME,
     DEFAULT_PORT,
+    START_CMD,
+    STOP_CMD,
+    Live,
     describe_event,
     describe_power,
     normalize_uuid,
+    response_mode,
     select_characteristic,
     select_device,
+    select_write,
 )
 
 
@@ -96,6 +101,75 @@ class DeviceSettingsTest(unittest.TestCase):
         )
         service = SimpleNamespace(uuid=normalize_uuid("fff0"), characteristics=[characteristic])
         self.assertIs(select_characteristic([service], "FFF1", "fff0"), characteristic)
+
+
+class ControlTests(unittest.TestCase):
+    def setUp(self):
+        self.live = Live(5)
+        self.live.connection_opened()
+
+    def test_start_bytes_and_only_samples_confirm(self):
+        self.assertTrue(self.live.request("start"))
+        token, command, payload = self.live.next_command()
+        self.assertEqual(payload, START_CMD)
+        self.live.command_written(token, command)
+        self.assertEqual(self.live.mode, "start_pending")
+        self.live.add(START_CMD)
+        self.assertEqual(self.live.mode, "start_pending")
+        self.live.add(sample_frame((1,) * 20, 10, 1000))
+        self.assertEqual(self.live.mode, "measuring")
+        self.live.command_written(token, command)
+        self.assertEqual(self.live.measurement, "Идут измерения")
+
+    def test_stop_waits_for_event_while_samples_still_arrive(self):
+        self.live.add(sample_frame((1,) * 20, 10, 1000))
+        self.assertTrue(self.live.request("stop"))
+        token, command, payload = self.live.next_command()
+        self.assertEqual(payload, STOP_CMD)
+        self.live.add(sample_frame((1,) * 20, 10, 1010))
+        self.assertEqual(self.live.mode, "stop_pending")
+        self.live.add(bytes((0x02, 3, 0)))
+        self.assertEqual(self.live.mode, "idle")
+        self.live.command_written(token, command)
+        self.assertIn("остановлено", self.live.measurement)
+
+    def test_cable_cancels_start_until_unplugged(self):
+        self.live.request("start")
+        self.live.add(bytes((0x02, 1, 0)))
+        self.assertIsNone(self.live.next_command())
+        self.assertFalse(self.live.controls()["can_start"])
+        self.live.add(struct.pack("<BHB", 1, 3700, 0))
+        self.assertTrue(self.live.controls()["can_start"])
+
+    def test_stop_replaces_start_still_in_queue(self):
+        self.live.request("start")
+        self.live.request("stop")
+        self.assertEqual(self.live.next_command()[2], STOP_CMD)
+        self.assertIsNone(self.live.next_command())
+
+    def test_disconnect_drops_start(self):
+        self.live.request("start")
+        self.live.connection_closed()
+        self.assertIsNone(self.live.next_command())
+        self.assertFalse(self.live.controls()["can_start"])
+
+    def test_write_characteristic_and_response_mode(self):
+        service_uuid = normalize_uuid("fff0")
+        notify = SimpleNamespace(
+            uuid=normalize_uuid("fff1"),
+            service_uuid=service_uuid,
+            properties=["notify"],
+        )
+        write = SimpleNamespace(
+            uuid=normalize_uuid("fff2"),
+            service_uuid=service_uuid,
+            properties=["write", "write-without-response"],
+        )
+        service = SimpleNamespace(uuid=service_uuid, characteristics=[notify, write])
+        self.assertIs(select_write([service], "fff2", None, notify), write)
+        self.assertTrue(response_mode(write, "auto"))
+        write.properties = ["write-without-response"]
+        self.assertFalse(response_mode(write, "auto"))
 
 
 if __name__ == "__main__":
